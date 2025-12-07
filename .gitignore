@@ -1,0 +1,6 @@
+new_venv
+.env
+pretrained_models/
+pretrained_models
+local_models
+local_models/
