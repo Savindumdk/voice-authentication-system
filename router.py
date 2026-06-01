@@ -9,8 +9,12 @@ import logging
 import sys
 import contextlib
 from io import StringIO
-from fastapi import APIRouter, UploadFile, File, HTTPException, Form, BackgroundTasks
+from fastapi import APIRouter, UploadFile, File, HTTPException, Form, BackgroundTasks, Depends
 from pydantic import BaseModel, Field
+from security import require_api_key, rate_limit
+from matching import rank_matches
+from antispoof import gate as antispoof_gate
+from config import settings
 from typing import Optional
 from dotenv import load_dotenv
 import asyncio
@@ -112,8 +116,11 @@ from database import save_user_embedding, get_all_user_embeddings, user_exists, 
 # Import global models
 from models import speaker_encoder, speaker_verifier, model_manager, DEVICE, CONFIG
 
-# Create router
-router = APIRouter()
+# Create router.
+# Auth + rate limiting are applied to every route in this router. The root "/"
+# and "/static" mount live on the app (main.py) and stay public so the web UI
+# loads. API auth activates automatically once API_KEY is set in the environment.
+router = APIRouter(dependencies=[Depends(rate_limit), Depends(require_api_key)])
 
 # Get HF auth token from environment
 HF_AUTH_TOKEN = os.getenv('HF_AUTH_TOKEN', None)
@@ -2566,10 +2573,15 @@ async def smart_authenticate(background_tasks: BackgroundTasks, user_id: str = F
         is_valid, error_message = audio_quality_gatekeeper(signal, fs)
         if not is_valid:
             raise HTTPException(status_code=400, detail=f"Audio quality check failed: {error_message}")
-        
+
+        # 🛡️ ANTI-SPOOFING / LIVENESS GATE (no-op unless ANTISPOOF_ENABLED)
+        allowed, antispoof_detail = antispoof_gate(signal, fs)
+        if not allowed:
+            raise HTTPException(status_code=403, detail=f"Liveness check failed: {antispoof_detail}")
+
         # 🎯 OPTIMAL SPEECH SEGMENT SELECTION
         print("🎯 Applying optimal speech segment selection...")
-        
+
         # Apply optimal segment selection for audio longer than 12 seconds
         if signal.shape[-1] / fs > 12.0:
             signal = find_optimal_speech_segment(signal, fs, target_duration=12.0, min_duration=4.0)
@@ -2583,12 +2595,16 @@ async def smart_authenticate(background_tasks: BackgroundTasks, user_id: str = F
             # USER EXISTS: PERFORM VERIFICATION
             print(f"👤 User '{user_id}' exists - performing verification...")
             
-            # Apply advanced VAD+Diarization pipeline for multi-speaker environments
+            # Apply advanced VAD+Diarization pipeline for multi-speaker environments.
+            # Skipped when HEAVY_PIPELINE_MODE=off (fast path for cooperative 1:1).
             enrolled_embeddings = get_all_user_embeddings()
-            enrolled_embeddings_for_pipeline = {user_id: enrolled_embeddings[user_id]}
-            signal = apply_advanced_vad_diarization_pipeline(signal, enrolled_embeddings_for_pipeline, sample_rate=fs)
-            signal = signal.to(DEVICE)  # Ensure it's on GPU after processing
-            print(f"🎯 Applied advanced VAD+Diarization pipeline, processed shape={signal.shape}")
+            if settings.HEAVY_PIPELINE_MODE != "off":
+                enrolled_embeddings_for_pipeline = {user_id: enrolled_embeddings[user_id]}
+                signal = apply_advanced_vad_diarization_pipeline(signal, enrolled_embeddings_for_pipeline, sample_rate=fs)
+                signal = signal.to(DEVICE)  # Ensure it's on GPU after processing
+                print(f"🎯 Applied advanced VAD+Diarization pipeline, processed shape={signal.shape}")
+            else:
+                print("⏭️ HEAVY_PIPELINE_MODE=off — skipping VAD/diarization/separation")
             
             # Extract embedding from verification audio
             verification_embedding = speaker_verifier.encode_batch(signal)
@@ -2749,10 +2765,15 @@ async def smart_authenticate_labeled(
         is_valid, error_message = audio_quality_gatekeeper(signal, fs)
         if not is_valid:
             raise HTTPException(status_code=400, detail=f"Audio quality check failed: {error_message}")
-        
+
+        # 🛡️ ANTI-SPOOFING / LIVENESS GATE (no-op unless ANTISPOOF_ENABLED)
+        allowed, antispoof_detail = antispoof_gate(signal, fs)
+        if not allowed:
+            raise HTTPException(status_code=403, detail=f"Liveness check failed: {antispoof_detail}")
+
         # 🎯 OPTIMAL SPEECH SEGMENT SELECTION
         print("🎯 Applying optimal speech segment selection...")
-        
+
         # Apply optimal segment selection for audio longer than 12 seconds
         if signal.shape[-1] / fs > 12.0:
             signal = find_optimal_speech_segment(signal, fs, target_duration=12.0, min_duration=4.0)
@@ -2778,12 +2799,16 @@ async def smart_authenticate_labeled(
             # USER EXISTS: PERFORM LABELED VERIFICATION
             print(f"👤 User '{user_id}' exists - performing labeled verification...")
             
-            # Apply advanced VAD+Diarization pipeline for multi-speaker environments
+            # Apply advanced VAD+Diarization pipeline for multi-speaker environments.
+            # Skipped when HEAVY_PIPELINE_MODE=off (fast path for cooperative 1:1).
             enrolled_embeddings = get_all_user_embeddings()
-            enrolled_embeddings_for_pipeline = {user_id: enrolled_embeddings[user_id]}
-            signal = apply_advanced_vad_diarization_pipeline(signal, enrolled_embeddings_for_pipeline, sample_rate=fs)
-            signal = signal.to(DEVICE)  # Ensure it's on GPU after processing
-            print(f"🎯 Applied advanced VAD+Diarization pipeline, processed shape={signal.shape}")
+            if settings.HEAVY_PIPELINE_MODE != "off":
+                enrolled_embeddings_for_pipeline = {user_id: enrolled_embeddings[user_id]}
+                signal = apply_advanced_vad_diarization_pipeline(signal, enrolled_embeddings_for_pipeline, sample_rate=fs)
+                signal = signal.to(DEVICE)  # Ensure it's on GPU after processing
+                print(f"🎯 Applied advanced VAD+Diarization pipeline, processed shape={signal.shape}")
+            else:
+                print("⏭️ HEAVY_PIPELINE_MODE=off — skipping VAD/diarization/separation")
             
             # Extract embedding from verification audio
             verification_embedding = speaker_verifier.encode_batch(signal)
@@ -2978,7 +3003,12 @@ async def identify_speaker(background_tasks: BackgroundTasks, file: UploadFile =
             if converted_file_path != verification_temp_file:
                 cleanup_temp_file(converted_file_path)
             raise HTTPException(status_code=400, detail=error_message)
-        
+
+        # 🛡️ ANTI-SPOOFING / LIVENESS GATE (no-op unless ANTISPOOF_ENABLED)
+        allowed, antispoof_detail = antispoof_gate(verification_signal, fs)
+        if not allowed:
+            raise HTTPException(status_code=403, detail=f"Liveness check failed: {antispoof_detail}")
+
         # 🎯 OPTIMAL SPEECH SEGMENT SELECTION
         print("🎯 Applying optimal speech segment selection...")
         original_verification_signal = verification_signal.clone()
@@ -2995,14 +3025,18 @@ async def identify_speaker(background_tasks: BackgroundTasks, file: UploadFile =
         verification_signal = enhanced_pause_robust_processing(verification_signal, fs)
         print(f"✅ Pause processing complete: {verification_signal.shape[-1]/fs:.1f}s continuous speech")
         
-        # Apply advanced VAD+Diarization+Separation pipeline with enrolled embeddings
-        verification_signal = apply_advanced_vad_diarization_pipeline(
-            verification_signal, 
-            enrolled_embeddings=enrolled_embeddings, 
-            sample_rate=fs
-        )
-        verification_signal = verification_signal.to(DEVICE)  # Ensure it's on GPU after processing
-        print(f"🎯 Applied advanced VAD+Diarization pipeline to verification audio, processed shape={verification_signal.shape}")
+        # Apply advanced VAD+Diarization+Separation pipeline with enrolled embeddings.
+        # Skipped when HEAVY_PIPELINE_MODE=off (fast path).
+        if settings.HEAVY_PIPELINE_MODE != "off":
+            verification_signal = apply_advanced_vad_diarization_pipeline(
+                verification_signal,
+                enrolled_embeddings=enrolled_embeddings,
+                sample_rate=fs
+            )
+            verification_signal = verification_signal.to(DEVICE)  # Ensure it's on GPU after processing
+            print(f"🎯 Applied advanced VAD+Diarization pipeline to verification audio, processed shape={verification_signal.shape}")
+        else:
+            print("⏭️ HEAVY_PIPELINE_MODE=off — skipping VAD/diarization/separation")
         
         # Import speaker_encoder from main
         from main import speaker_encoder
@@ -3011,25 +3045,14 @@ async def identify_speaker(background_tasks: BackgroundTasks, file: UploadFile =
         
         print(f"🎯 Verification embedding shape: {verification_embedding.shape}")
         
-        # Compare with all enrolled users using cosine similarity
-        for user_id, enrolled_embedding in enrolled_embeddings.items():
-            # Ensure enrolled embedding is on the same device
-            enrolled_embedding = enrolled_embedding.to(DEVICE)
-            
-            # Compute cosine similarity between embeddings
-            verification_norm = verification_embedding / verification_embedding.norm(dim=-1, keepdim=True)
-            enrolled_norm = enrolled_embedding / enrolled_embedding.norm(dim=-1, keepdim=True)
-            
-            # Cosine similarity
-            similarity = torch.cosine_similarity(verification_norm.squeeze(), enrolled_norm.squeeze(), dim=0)
-            current_score = similarity.item()
-            
+        # Compare with all enrolled users using a single batched cosine op.
+        # (Equivalent to the previous per-user loop, but O(1) Python overhead.)
+        ranked = rank_matches(verification_embedding, enrolled_embeddings)
+        for user_id, current_score in ranked:
             print(f"👤 User '{user_id}': similarity score = {current_score:.4f}")
-            
-            if current_score > best_score:
-                best_score = current_score
-                identified_user = user_id
-        
+        if ranked:
+            identified_user, best_score = ranked[0]
+
         print(f"\n🎯 Best match: User '{identified_user}' with score {best_score:.4f}")
         print(f"🎚️ Threshold: {CONFIG.VERIFICATION_THRESHOLD}")
         

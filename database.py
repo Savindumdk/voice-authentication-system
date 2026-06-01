@@ -9,8 +9,13 @@ from pymongo import MongoClient
 load_dotenv()
 
 class DatabaseConfig:
-    """Database configuration class"""
-    MONGODB_URI = os.getenv("MONGODB_URI", "mongodb+srv://savindumdk:mazner2002@cluster0.7ebo7.mongodb.net/")
+    """Database configuration class.
+
+    MONGODB_URI is intentionally NOT defaulted to a real connection string.
+    Credentials must come from the environment (.env / secrets manager) so they
+    are never committed to source control.
+    """
+    MONGODB_URI = os.getenv("MONGODB_URI")
     DATABASE_NAME = os.getenv("DATABASE_NAME", "voice_auth")
     COLLECTION_NAME = os.getenv("COLLECTION_NAME", "user_data")
 
@@ -25,10 +30,20 @@ def initialize_database():
     
     try:
         config = DatabaseConfig()
-        client = MongoClient(config.MONGODB_URI)
+
+        # Fail closed: never fall back to a hardcoded connection string.
+        if not config.MONGODB_URI:
+            print("❌ MONGODB_URI is not set. Refusing to start without explicit "
+                  "database credentials. Set MONGODB_URI in your environment/.env.")
+            client = None
+            db = None
+            collection = None
+            return False
+
+        client = MongoClient(config.MONGODB_URI, serverSelectionTimeoutMS=10000)
         db = client[config.DATABASE_NAME]
         collection = db[config.COLLECTION_NAME]
-        
+
         # Test connection
         client.admin.command('ping')
         print("✅ MongoDB connection established successfully.")

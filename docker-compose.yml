@@ -1,0 +1,34 @@
+# Local/prod compose for the Voice Authentication API on a GPU host.
+# Requires the NVIDIA Container Toolkit on the host.
+services:
+  voice-auth:
+    build: .
+    image: voice-auth:latest
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Persist downloaded models across container restarts.
+      HF_HOME: /models/hf
+      TORCH_HOME: /models/torch
+    volumes:
+      - model-cache:/models
+      - ./pretrained_models:/app/pretrained_models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
+volumes:
+  model-cache:

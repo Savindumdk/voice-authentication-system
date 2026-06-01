@@ -1,6 +1,29 @@
+# Virtual environments
 new_venv
+.venv
+venv
+
+# Secrets / environment
 .env
+*.env
+!.env.example
+
+# Model artifacts
 pretrained_models/
 pretrained_models
 local_models
 local_models/
+
+# Python caches & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Temp audio / converted files
+*_converted.wav
+tmp/
+temp/
