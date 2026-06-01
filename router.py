@@ -12,7 +12,6 @@ from io import StringIO
 from fastapi import APIRouter, UploadFile, File, HTTPException, Form, BackgroundTasks, Depends
 from pydantic import BaseModel, Field
 from security import require_api_key, rate_limit
-from matching import rank_matches
 from antispoof import gate as antispoof_gate
 from config import settings
 from embeddings import extract_embedding
@@ -113,7 +112,7 @@ if DEVICE.type == "cuda":
     torch.backends.cudnn.deterministic = False  # Allow non-deterministic algorithms for speed
 
 # Import database functions
-from database import save_user_embedding, get_all_user_embeddings, get_user_embedding, user_exists, save_user_samples, get_user_enrollment_info, update_user_embedding_ewma, store_voice_sample, store_labeled_voice_sample, get_voice_data_statistics, get_user_voice_samples, vector_search_users
+from database import save_user_embedding, get_user_embedding, user_exists, get_user_enrollment_info, update_user_embedding_ewma, store_voice_sample
 
 # Import global models
 from models import speaker_encoder, speaker_verifier, model_manager, DEVICE, CONFIG
@@ -719,8 +718,10 @@ class SmartAuthResponse(BaseModel):
     status: str = Field(..., description="The status of the operation: 'success' or 'failed'")
     user_id: str = Field(..., description="The user ID processed")
     message: str = Field(..., description="Descriptive message about the operation")
-    similarity_score: Optional[float] = Field(None, description="Similarity score (only for verification)")
-    verified: Optional[bool] = Field(None, description="Verification result (only for verification)")
+    similarity_score: Optional[float] = Field(None, description="Cosine similarity score (verification only)")
+    verified: Optional[bool] = Field(None, description="Verification result (verification only)")
+    threshold: Optional[float] = Field(None, description="Verification threshold used (verification only)")
+    processing_ms: Optional[float] = Field(None, description="Server-side processing time in milliseconds")
 
 class LabeledSmartAuthResponse(BaseModel):
     action: str = Field(..., description="The action performed: 'enrolled' or 'verified'")
@@ -2275,128 +2276,6 @@ class EnrollmentSession:
     def get_averaged_embedding(self) -> torch.Tensor:
         return average_embeddings(self.sample_embeddings)
 
-@router.post("/enroll-sample", response_model=MultiSampleEnrollmentResponse, tags=["Speaker Management"])
-async def enroll_sample(user_id: str = Form(...), file: UploadFile = File(...)):
-    """Add a sample to multi-sample enrollment process."""
-    from main import speaker_encoder
-    
-    if not speaker_encoder:
-        raise HTTPException(status_code=500, detail="Speaker encoder model not available.")
-    
-    # Check if user already exists with completed enrollment
-    if user_exists(user_id):
-        enrollment_info = get_user_enrollment_info(user_id)
-        if enrollment_info and enrollment_info.get('enrollment_type') == 'multi_sample':
-            raise HTTPException(status_code=409, detail=f"User '{user_id}' already has a complete multi-sample enrollment. Use /enroll-replace to replace it.")
-    
-    # Get or create enrollment session
-    session_key = f"session_{user_id}"
-    if session_key not in enrollment_sessions:
-        enrollment_sessions[session_key] = EnrollmentSession(user_id)
-    
-    session = enrollment_sessions[session_key]
-    
-    temp_file_path = None
-    converted_file_path = None
-    
-    try:
-        # Validate file size (2MB limit)
-        await validate_file_size(file, max_size_mb=2.0)
-        
-        # Process audio file
-        temp_file_path = await save_upload_to_temp_file(file)
-        print(f"📁 Processing sample {len(session.sample_embeddings) + 1} for user '{user_id}'")
-        
-        # Convert audio to compatible format
-        converted_file_path = await run_blocking(convert_audio_to_wav, temp_file_path)
-        
-        # Load and process audio
-        signal, fs = await run_blocking(torchaudio.load, converted_file_path)
-        signal = signal.to(DEVICE)  # Move to GPU
-        print(f"🎵 Loaded audio: shape={signal.shape}, sample_rate={fs}")
-        
-        # 🚦 AUDIO QUALITY GATEKEEPER
-        is_valid, error_message = audio_quality_gatekeeper(signal, fs)
-        if not is_valid:
-            cleanup_temp_file(temp_file_path)
-            if converted_file_path != temp_file_path:
-                cleanup_temp_file(converted_file_path)
-            raise HTTPException(status_code=400, detail=error_message)
-        
-        # 🎯 OPTIMAL SPEECH SEGMENT SELECTION
-        print("🎯 Applying optimal speech segment selection for enrollment...")
-        original_signal = signal.clone()
-        
-        # Apply optimal segment selection for audio longer than 12 seconds
-        if signal.shape[-1] / fs > 12.0:
-            signal = await run_blocking(find_optimal_speech_segment, signal, fs, target_duration=12.0, min_duration=8.0)
-            print(f"✅ Selected optimal {signal.shape[-1]/fs:.1f}s segment from original {original_signal.shape[-1]/fs:.1f}s audio")
-        else:
-            print(f"📋 Audio duration ({signal.shape[-1]/fs:.1f}s) within optimal range, proceeding without segment selection")
-        
-        # 🔇 ENHANCED PAUSE-ROBUST PROCESSING
-        print("🔇 Applying enhanced pause-robust processing for enrollment...")
-        signal = await run_blocking(enhanced_pause_robust_processing, signal, fs)
-        print(f"✅ Pause processing complete: {signal.shape[-1]/fs:.1f}s continuous speech")
-        
-        # Apply enhanced enrollment speaker selection (optimized for enrollment quality)
-        signal = await run_inference(apply_enrollment_speaker_selection, signal, sample_rate=fs)
-        signal = signal.to(DEVICE)  # Ensure it's on GPU after processing
-        print(f"🎯 Applied enhanced enrollment speaker selection, processed shape={signal.shape}")
-        
-        # Extract embedding
-        embedding = await run_inference(extract_embedding, signal)
-        embedding = embedding.to(DEVICE)  # Ensure embedding is on GPU
-        print(f"🔢 Generated embedding shape: {embedding.shape}")
-        
-        # Add sample to session
-        session.add_sample(embedding)
-        
-        # Check if enrollment is complete
-        if session.is_complete():
-            # Calculate quality metrics
-            quality, avg_similarity = calculate_embedding_quality(session.sample_embeddings)
-            
-            # Create averaged embedding
-            averaged_embedding = session.get_averaged_embedding()
-            
-            # Save to database
-            success = save_user_samples(user_id, session.sample_embeddings, averaged_embedding)
-            
-            if success:
-                # Clean up session
-                del enrollment_sessions[session_key]
-                
-                return MultiSampleEnrollmentResponse(
-                    status="complete",
-                    user_id=user_id,
-                    message=f"Multi-sample enrollment complete! Quality: {quality} (avg similarity: {avg_similarity:.3f})",
-                    samples_collected=len(session.sample_embeddings),
-                    total_samples_needed=session.target_samples,
-                    enrollment_complete=True
-                )
-            else:
-                raise HTTPException(status_code=500, detail="Failed to save enrollment data.")
-        else:
-            return MultiSampleEnrollmentResponse(
-                status="in_progress",
-                user_id=user_id,
-                message=f"Sample {len(session.sample_embeddings)} collected. Please provide {session.target_samples - len(session.sample_embeddings)} more samples.",
-                samples_collected=len(session.sample_embeddings),
-                total_samples_needed=session.target_samples,
-                enrollment_complete=False
-            )
-    
-    except Exception as e:
-        print(f"❌ Sample enrollment error: {e}")
-        raise HTTPException(status_code=500, detail=f"Sample enrollment failed: {str(e)}")
-    
-    finally:
-        if temp_file_path:
-            cleanup_temp_file(temp_file_path)
-        if converted_file_path and converted_file_path != temp_file_path:
-            cleanup_temp_file(converted_file_path)
-
 @router.get("/enrollment-status/{user_id}", response_model=EnrollmentStatusResponse, tags=["Speaker Management"])
 async def get_enrollment_status(user_id: str):
     """Get enrollment status and quality information for a user."""
@@ -2456,90 +2335,6 @@ async def clear_enrollment(user_id: str):
     # For database clearing, you might want to implement this based on your needs
     return {"message": f"No active enrollment session found for user '{user_id}'"}
 
-@router.post("/enroll", response_model=EnrollmentResponse, tags=["Speaker Management"])
-async def enroll_speaker(user_id: str = Form(...), file: UploadFile = File(...)):
-    """Enroll a new speaker using SpeechBrain's EncoderClassifier."""
-    from main import speaker_encoder
-    
-    if not speaker_encoder:
-        raise HTTPException(status_code=500, detail="Speaker encoder model not available.")
-    
-    if user_exists(user_id):
-        raise HTTPException(status_code=409, detail=f"User '{user_id}' is already enrolled.")
-    
-    temp_file_path = None
-    converted_file_path = None
-    try:
-        # Validate file size (2MB limit)
-        await validate_file_size(file, max_size_mb=2.0)
-        
-        # Save uploaded file to temporary location
-        temp_file_path = await save_upload_to_temp_file(file)
-        print(f"📁 Uploaded file type: {file.content_type}, filename: {file.filename}")
-        
-        # Convert audio to compatible format
-        converted_file_path = await run_blocking(convert_audio_to_wav, temp_file_path)
-        
-        # Load audio using torchaudio (as per SpeechBrain documentation)
-        signal, fs = await run_blocking(torchaudio.load, converted_file_path)
-        signal = signal.to(DEVICE)  # Move to GPU
-        print(f"🎵 Loaded audio: shape={signal.shape}, sample_rate={fs}")
-        
-        # 🚦 AUDIO QUALITY GATEKEEPER
-        is_valid, error_message = audio_quality_gatekeeper(signal, fs)
-        if not is_valid:
-            cleanup_temp_file(temp_file_path)
-            if converted_file_path != temp_file_path:
-                cleanup_temp_file(converted_file_path)
-            raise HTTPException(status_code=400, detail=error_message)
-        
-        # 🎯 OPTIMAL SPEECH SEGMENT SELECTION
-        print("🎯 Applying optimal speech segment selection for single enrollment...")
-        original_signal = signal.clone()
-        
-        # Apply optimal segment selection for audio longer than 12 seconds
-        if signal.shape[-1] / fs > 12.0:
-            signal = await run_blocking(find_optimal_speech_segment, signal, fs, target_duration=12.0, min_duration=8.0)
-            print(f"✅ Selected optimal {signal.shape[-1]/fs:.1f}s segment from original {original_signal.shape[-1]/fs:.1f}s audio")
-        else:
-            print(f"📋 Audio duration ({signal.shape[-1]/fs:.1f}s) within optimal range, proceeding without segment selection")
-        
-        # 🔇 ENHANCED PAUSE-ROBUST PROCESSING
-        print("🔇 Applying enhanced pause-robust processing for single enrollment...")
-        signal = await run_blocking(enhanced_pause_robust_processing, signal, fs)
-        print(f"✅ Pause processing complete: {signal.shape[-1]/fs:.1f}s continuous speech")
-        
-        # Apply enhanced enrollment speaker selection (optimized for enrollment quality)
-        signal = await run_inference(apply_enrollment_speaker_selection, signal, sample_rate=fs)
-        signal = signal.to(DEVICE)  # Ensure it's on GPU after processing
-        print(f"🎯 Applied enhanced enrollment speaker selection, processed shape={signal.shape}")
-        
-        # Extract embedding using EncoderClassifier
-        embedding = await run_inference(extract_embedding, signal)
-        embedding = embedding.to(DEVICE)  # Ensure embedding is on GPU
-        print(f"🔢 Generated embedding shape: {embedding.shape}")
-        
-        # Save to database
-        if save_user_embedding(user_id, embedding):
-            return EnrollmentResponse(
-                status="success", 
-                user_id=user_id, 
-                message=f"User '{user_id}' enrolled successfully."
-            )
-        else:
-            raise HTTPException(status_code=500, detail="Failed to save user enrollment data.")
-    
-    except Exception as e:
-        print(f"❌ Enrollment error: {e}")
-        raise HTTPException(status_code=500, detail=f"Enrollment failed: {str(e)}")
-    
-    finally:
-        # Clean up temporary files
-        if temp_file_path:
-            cleanup_temp_file(temp_file_path)
-        if converted_file_path and converted_file_path != temp_file_path:
-            cleanup_temp_file(converted_file_path)
-
 @router.post("/smart-auth", response_model=SmartAuthResponse, tags=["Voice Authentication"])
 async def smart_authenticate(background_tasks: BackgroundTasks, user_id: str = Form(...), file: UploadFile = File(...)):
     """
@@ -2550,6 +2345,8 @@ async def smart_authenticate(background_tasks: BackgroundTasks, user_id: str = F
     
     This endpoint is perfect for seamless user onboarding and authentication.
     """
+    import time
+    start_time = time.perf_counter()
     from main import speaker_encoder, speaker_verifier, CONFIG
     
     if not speaker_encoder or not speaker_verifier:
@@ -2668,7 +2465,9 @@ async def smart_authenticate(background_tasks: BackgroundTasks, user_id: str = F
                 user_id=user_id,
                 message=message,
                 similarity_score=score,
-                verified=verified
+                verified=verified,
+                threshold=verification_threshold,
+                processing_ms=round((time.perf_counter() - start_time) * 1000, 1),
             )
             
         else:
@@ -2702,7 +2501,9 @@ async def smart_authenticate(background_tasks: BackgroundTasks, user_id: str = F
                 user_id=user_id,
                 message=message,
                 similarity_score=None,
-                verified=None
+                verified=None,
+                threshold=None,
+                processing_ms=round((time.perf_counter() - start_time) * 1000, 1),
             )
     
     except HTTPException:
@@ -2716,416 +2517,6 @@ async def smart_authenticate(background_tasks: BackgroundTasks, user_id: str = F
         if temp_file_path:
             cleanup_temp_file(temp_file_path)
         if converted_file_path and converted_file_path != temp_file_path:
-            cleanup_temp_file(converted_file_path)
-
-@router.post("/smart-auth-labeled", response_model=LabeledSmartAuthResponse, tags=["Voice Authentication"])
-async def smart_authenticate_labeled(
-    background_tasks: BackgroundTasks, 
-    user_id: str = Form(...), 
-    is_actual_speaker: bool = Form(..., description="Ground truth label: True if this is the actual speaker, False if imposter"),
-    file: UploadFile = File(...)
-):
-    """
-    Labeled smart authentication endpoint for training data collection.
-    
-    This endpoint works like smart-auth but includes ground truth labels to indicate whether
-    the voice sample is from the actual speaker or an imposter. All data is stored in the
-    sample_voice_data collection with labels for machine learning model training and evaluation.
-    
-    - If user_id exists: Performs verification and stores labeled verification data
-    - If user_id doesn't exist: Enrolls the user and stores labeled enrollment data
-    
-    Args:
-        user_id: The claimed user identity
-        is_actual_speaker: Ground truth label (True = actual speaker, False = imposter)
-        file: Audio file for authentication
-    
-    Returns:
-        Authentication result with ground truth labels and storage confirmation
-    """
-    from main import speaker_encoder, speaker_verifier, CONFIG
-    
-    if not speaker_encoder or not speaker_verifier:
-        raise HTTPException(status_code=500, detail="Speaker models not available.")
-    
-    # Check if user already exists
-    user_already_exists = user_exists(user_id)
-    
-    temp_file_path = None
-    converted_file_path = None
-    data_stored = False
-    
-    try:
-        # Validate file size (2MB limit)
-        await validate_file_size(file, max_size_mb=2.0)
-        
-        # Save uploaded file to temporary location
-        temp_file_path = await save_upload_to_temp_file(file)
-        label_str = "ACTUAL" if is_actual_speaker else "IMPOSTER"
-        print(f"🏷️ Processing labeled smart auth for user '{user_id}' [{label_str}] (exists: {user_already_exists})")
-        
-        # Convert audio to compatible format
-        converted_file_path = await run_blocking(convert_audio_to_wav, temp_file_path)
-        
-        # Load and process audio
-        signal, fs = await run_blocking(torchaudio.load, converted_file_path)
-        signal = signal.to(DEVICE)  # Move to GPU
-        print(f"🎵 Loaded audio: shape={signal.shape}, sample_rate={fs}")
-        
-        # 🚦 AUDIO QUALITY GATEKEEPER
-        is_valid, error_message = audio_quality_gatekeeper(signal, fs)
-        if not is_valid:
-            raise HTTPException(status_code=400, detail=f"Audio quality check failed: {error_message}")
-
-        # 🛡️ ANTI-SPOOFING / LIVENESS GATE (no-op unless ANTISPOOF_ENABLED)
-        allowed, antispoof_detail = await run_inference(antispoof_gate, signal, fs)
-        if not allowed:
-            raise HTTPException(status_code=403, detail=f"Liveness check failed: {antispoof_detail}")
-
-        # 🎯 OPTIMAL SPEECH SEGMENT SELECTION
-        print("🎯 Applying optimal speech segment selection...")
-
-        # Apply optimal segment selection for audio longer than 12 seconds
-        if signal.shape[-1] / fs > 12.0:
-            signal = await run_blocking(find_optimal_speech_segment, signal, fs, target_duration=12.0, min_duration=4.0)
-            print(f"✅ Selected optimal segment: {signal.shape[-1]/fs:.1f}s")
-        else:
-            print(f"✅ Audio duration acceptable: {signal.shape[-1]/fs:.1f}s")
-        
-        # 🔇 ENHANCED PAUSE-ROBUST PROCESSING
-        print("🔇 Applying enhanced pause-robust processing...")
-        original_duration_sec = signal.shape[-1] / fs
-        signal = await run_blocking(enhanced_pause_robust_processing, signal, fs)
-        processed_duration_sec = signal.shape[-1] / fs
-        print(f"✅ Pause processing complete: {processed_duration_sec:.1f}s continuous speech")
-
-        # 📈 Compute audio metrics
-        energy_level = compute_rms_energy(signal)
-        snr_db = estimate_snr_db(signal, fs)
-        # If you computed diarization earlier, pass diarization_count here to avoid any heavy work.
-        # For now, we pass None so the function uses a lightweight fallback (returns 1).
-        speakers_detected = detect_number_of_speakers(signal, fs, diarization_count=None)
-        
-        if user_already_exists:
-            # USER EXISTS: PERFORM LABELED VERIFICATION
-            print(f"👤 User '{user_id}' exists - performing labeled verification...")
-            
-            # Fetch ONLY this user's voiceprint — an indexed single-document
-            # lookup. 1:1 verification never needs the whole collection.
-            enrolled_embedding = await run_blocking(get_user_embedding, user_id)
-            if enrolled_embedding is None:
-                raise HTTPException(status_code=404, detail=f"No enrolled voiceprint for user '{user_id}'.")
-            enrolled_embedding = enrolled_embedding.to(DEVICE)
-
-            # Apply advanced VAD+Diarization pipeline for multi-speaker environments.
-            # Skipped when HEAVY_PIPELINE_MODE=off (fast path for cooperative 1:1).
-            if settings.HEAVY_PIPELINE_MODE != "off":
-                enrolled_embeddings_for_pipeline = {user_id: enrolled_embedding}
-                signal = await run_inference(apply_advanced_vad_diarization_pipeline, signal, enrolled_embeddings_for_pipeline, sample_rate=fs)
-                signal = signal.to(DEVICE)  # Ensure it's on GPU after processing
-                print(f"🎯 Applied advanced VAD+Diarization pipeline, processed shape={signal.shape}")
-            else:
-                print("⏭️ HEAVY_PIPELINE_MODE=off — skipping VAD/diarization/separation")
-
-            # Extract embedding from verification audio
-            verification_embedding = await run_inference(extract_embedding, signal)
-            verification_embedding = verification_embedding.to(DEVICE)  # Ensure embedding is on GPU
-            print(f"🔢 Generated verification embedding shape: {verification_embedding.shape}")
-            
-            # Compute similarity score using cosine similarity
-            print(f"🔍 Computing similarity score for user '{user_id}'...")
-            
-            # Normalize embeddings for cosine similarity
-            enrolled_norm = enrolled_embedding / enrolled_embedding.norm(dim=-1, keepdim=True)
-            verification_norm = verification_embedding / verification_embedding.norm(dim=-1, keepdim=True)
-            
-            # Compute cosine similarity
-            similarity_score = torch.cosine_similarity(enrolled_norm.squeeze(), verification_norm.squeeze(), dim=0)
-            score = similarity_score.item()
-            
-            print(f"📊 User '{user_id}' similarity score: {score:.4f}")
-            
-            # Determine if verification passed
-            verification_threshold = CONFIG.VERIFICATION_THRESHOLD
-            verified = score >= verification_threshold
-            
-            # Store labeled verification data in database
-            audio_info = {
-                "sample_rate": fs,
-                "action_type": "verification",
-                "audio_shape": list(signal.shape),
-                "energy_level": energy_level,
-                "snr_db": snr_db,
-                "original_audio_length_sec": original_duration_sec,
-                "speech_detected_audio_length_sec": processed_duration_sec,
-                "speakers_detected": speakers_detected
-            }
-            
-            data_stored = store_labeled_voice_sample(
-                user_id=user_id,
-                embedding=verification_embedding,
-                similarity_score=score,
-                is_actual_speaker=is_actual_speaker,
-                audio_duration=signal.shape[-1] / fs,
-                audio_info=audio_info
-            )
-            
-            # Schedule background task for EWMA adaptation (but not regular storage as we already stored labeled data)
-            if CONFIG.EWMA_ENABLED and score >= CONFIG.EWMA_ADAPTATION_THRESHOLD:
-                background_tasks.add_task(
-                    background_retrain_and_store,
-                    user_id,
-                    verification_embedding,
-                    score,
-                    signal,
-                    fs
-                )
-            
-            # Prepare verification response
-            if verified:
-                status = "success"
-                message = f"User '{user_id}' [{label_str}] successfully verified with score {score:.4f} (threshold: {verification_threshold:.3f})"
-                print(f"✅ {message}")
-            else:
-                status = "failed"
-                message = f"User '{user_id}' [{label_str}] verification failed with score {score:.4f} (threshold: {verification_threshold:.3f})"
-                print(f"❌ {message}")
-            
-            return LabeledSmartAuthResponse(
-                action="verified",
-                status=status,
-                user_id=user_id,
-                is_actual_speaker=is_actual_speaker,
-                message=message,
-                similarity_score=score,
-                verified=verified,
-                data_stored=data_stored
-            )
-            
-        else:
-            # USER DOESN'T EXIST: PERFORM LABELED ENROLLMENT
-            print(f"🆕 User '{user_id}' doesn't exist - performing labeled enrollment...")
-            
-            # Apply enhanced enrollment speaker selection (optimized for enrollment quality)
-            signal = await run_inference(apply_enrollment_speaker_selection, signal, sample_rate=fs)
-            signal = signal.to(DEVICE)  # Ensure it's on GPU after processing
-            print(f"🎯 Applied enhanced enrollment speaker selection, processed shape={signal.shape}")
-            
-            # Extract embedding using EncoderClassifier
-            embedding = await run_inference(extract_embedding, signal)
-            embedding = embedding.to(DEVICE)  # Ensure embedding is on GPU
-            print(f"🔢 Generated enrollment embedding shape: {embedding.shape}")
-            
-            # Save enrollment to database
-            enrollment_success = save_user_embedding(user_id, embedding)
-            
-            # Store labeled enrollment data in sample_voice_data collection
-            audio_info = {
-                "sample_rate": fs,
-                "action_type": "enrollment",
-                "audio_shape": list(signal.shape),
-                "energy_level": energy_level,
-                "snr_db": snr_db,
-                "original_audio_length_sec": original_duration_sec,
-                "speech_detected_audio_length_sec": processed_duration_sec,
-                "speakers_detected": speakers_detected
-            }
-            
-            data_stored = store_labeled_voice_sample(
-                user_id=user_id,
-                embedding=embedding,
-                similarity_score=1.0,  # Perfect score for enrollment data
-                is_actual_speaker=is_actual_speaker,
-                audio_duration=signal.shape[-1] / fs,
-                audio_info=audio_info
-            )
-            
-            if enrollment_success:
-                status = "success"
-                message = f"User '{user_id}' [{label_str}] successfully enrolled with voiceprint from {signal.shape[-1]/fs:.1f}s of audio"
-                print(f"✅ {message}")
-            else:
-                status = "failed"
-                message = f"Failed to save enrollment data for user '{user_id}' [{label_str}]"
-                print(f"❌ {message}")
-                raise HTTPException(status_code=500, detail=message)
-            
-            return LabeledSmartAuthResponse(
-                action="enrolled",
-                status=status,
-                user_id=user_id,
-                is_actual_speaker=is_actual_speaker,
-                message=message,
-                similarity_score=None,
-                verified=None,
-                data_stored=data_stored
-            )
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"❌ Labeled smart authentication error: {e}")
-        raise HTTPException(status_code=500, detail=f"Labeled smart authentication failed: {str(e)}")
-    
-    finally:
-        # Clean up temporary files
-        if temp_file_path:
-            cleanup_temp_file(temp_file_path)
-        if converted_file_path and converted_file_path != temp_file_path:
-            cleanup_temp_file(converted_file_path)
-
-@router.post("/identify", response_model=IdentificationResponse, tags=["Voice Authentication"])
-async def identify_speaker(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    """Identify speaker using SpeechBrain's built-in verification methods."""
-    from main import speaker_verifier, CONFIG
-    
-    if not speaker_verifier:
-        raise HTTPException(status_code=500, detail="Speaker verifier model not available.")
-    
-    # When Atlas Vector Search handles matching AND the heavy multi-speaker
-    # pipeline is off, we avoid loading every embedding into memory.
-    need_full_embeddings = (not settings.USE_VECTOR_SEARCH) or (settings.HEAVY_PIPELINE_MODE != "off")
-    enrolled_embeddings = await run_blocking(get_all_user_embeddings) if need_full_embeddings else {}
-    if need_full_embeddings and not enrolled_embeddings:
-        raise HTTPException(status_code=404, detail="No enrolled users found.")
-
-    verification_temp_file = None
-    converted_file_path = None
-    
-    try:
-        # Validate file size (2MB limit)
-        await validate_file_size(file, max_size_mb=2.0)
-        
-        # Save verification audio to temporary file
-        verification_temp_file = await save_upload_to_temp_file(file)
-        print(f"📁 Uploaded file type: {file.content_type}, filename: {file.filename}")
-        
-        # Convert audio to compatible format
-        converted_file_path = await run_blocking(convert_audio_to_wav, verification_temp_file)
-        
-        best_score = -1.0
-        identified_user = None
-        
-        print(f"\n🔍 Starting speaker verification for {len(enrolled_embeddings)} enrolled users...")
-        
-        # Load verification audio
-        verification_signal, fs = await run_blocking(torchaudio.load, converted_file_path)
-        verification_signal = verification_signal.to(DEVICE)  # Move to GPU
-        print(f"🎵 Loaded verification audio: shape={verification_signal.shape}, sample_rate={fs}")
-        
-        # 🚦 AUDIO QUALITY GATEKEEPER
-        is_valid, error_message = audio_quality_gatekeeper(verification_signal, fs)
-        if not is_valid:
-            cleanup_temp_file(verification_temp_file)
-            if converted_file_path != verification_temp_file:
-                cleanup_temp_file(converted_file_path)
-            raise HTTPException(status_code=400, detail=error_message)
-
-        # 🛡️ ANTI-SPOOFING / LIVENESS GATE (no-op unless ANTISPOOF_ENABLED)
-        allowed, antispoof_detail = await run_inference(antispoof_gate, verification_signal, fs)
-        if not allowed:
-            raise HTTPException(status_code=403, detail=f"Liveness check failed: {antispoof_detail}")
-
-        # 🎯 OPTIMAL SPEECH SEGMENT SELECTION
-        print("🎯 Applying optimal speech segment selection...")
-        original_verification_signal = verification_signal.clone()
-        
-        # Apply optimal segment selection for audio longer than 12 seconds
-        if verification_signal.shape[-1] / fs > 12.0:
-            verification_signal = await run_blocking(find_optimal_speech_segment, verification_signal, fs, target_duration=12.0, min_duration=4.0)
-            print(f"✅ Selected optimal {verification_signal.shape[-1]/fs:.1f}s segment from original {original_verification_signal.shape[-1]/fs:.1f}s audio")
-        else:
-            print(f"📋 Audio duration ({verification_signal.shape[-1]/fs:.1f}s) within optimal range, proceeding without segment selection")
-        
-        # 🔇 ENHANCED PAUSE-ROBUST PROCESSING
-        print("🔇 Applying enhanced pause-robust processing...")
-        verification_signal = await run_blocking(enhanced_pause_robust_processing, verification_signal, fs)
-        print(f"✅ Pause processing complete: {verification_signal.shape[-1]/fs:.1f}s continuous speech")
-        
-        # Apply advanced VAD+Diarization+Separation pipeline with enrolled embeddings.
-        # Skipped when HEAVY_PIPELINE_MODE=off (fast path).
-        if settings.HEAVY_PIPELINE_MODE != "off":
-            verification_signal = await run_inference(
-                apply_advanced_vad_diarization_pipeline,
-                verification_signal,
-                enrolled_embeddings=enrolled_embeddings,
-                sample_rate=fs
-            )
-            verification_signal = verification_signal.to(DEVICE)  # Ensure it's on GPU after processing
-            print(f"🎯 Applied advanced VAD+Diarization pipeline to verification audio, processed shape={verification_signal.shape}")
-        else:
-            print("⏭️ HEAVY_PIPELINE_MODE=off — skipping VAD/diarization/separation")
-        
-        # Import speaker_encoder from main
-        from main import speaker_encoder
-        verification_embedding = await run_inference(extract_embedding, verification_signal)
-        verification_embedding = verification_embedding.to(DEVICE)  # Ensure GPU
-        
-        print(f"🎯 Verification embedding shape: {verification_embedding.shape}")
-        
-        # 1:N matching. Prefer Atlas Vector Search (scales without loading every
-        # embedding); otherwise the in-memory batched cosine over all users.
-        if settings.USE_VECTOR_SEARCH:
-            query_vec = verification_embedding.squeeze().detach().cpu().tolist()
-            ranked = await run_blocking(
-                vector_search_users,
-                query_vec,
-                settings.VECTOR_TOP_K,
-                settings.VECTOR_NUM_CANDIDATES,
-                settings.VECTOR_INDEX_NAME,
-            )
-        else:
-            ranked = rank_matches(verification_embedding, enrolled_embeddings)
-        for user_id, current_score in ranked:
-            print(f"👤 User '{user_id}': similarity score = {current_score:.4f}")
-        if ranked:
-            identified_user, best_score = ranked[0]
-
-        print(f"\n🎯 Best match: User '{identified_user}' with score {best_score:.4f}")
-        print(f"🎚️ Threshold: {CONFIG.VERIFICATION_THRESHOLD}")
-        
-        if best_score >= CONFIG.VERIFICATION_THRESHOLD:
-            # 🚀 OPTIMIZATION: Send response immediately, then do background processing
-            print(f"🎯 High-confidence verification (score: {best_score:.4f} ≥ {CONFIG.EWMA_ADAPTATION_THRESHOLD})")
-            
-            # Schedule background task for EWMA adaptation and voice sample storage
-            if identified_user:
-                
-                background_tasks.add_task(
-                    background_retrain_and_store,
-                    user_id=identified_user,
-                    verification_embedding=verification_embedding,
-                    best_score=best_score,
-                    verification_signal=verification_signal,
-                    fs=fs
-                )
-                print(f"📋 Background retraining and storage scheduled for {identified_user}")
-            
-            return IdentificationResponse(
-                status="success", 
-                identified_user_id=identified_user, 
-                message=f"Speaker identified as {identified_user}.", 
-                highest_score=best_score
-            )
-        else:
-            return IdentificationResponse(
-                status="failure", 
-                identified_user_id=None, 
-                message="Speaker not recognized or score below threshold.", 
-                highest_score=best_score
-            )
-    
-    except HTTPException:
-        raise  # Re-raise HTTP exceptions (like quality check failures)
-    except Exception as e:
-        print(f"❌ Identification error: {e}")
-        raise HTTPException(status_code=500, detail=f"Identification failed: {str(e)}")
-    
-    finally:
-        # Clean up temporary files
-        if verification_temp_file:
-            cleanup_temp_file(verification_temp_file)
-        if converted_file_path and converted_file_path != verification_temp_file:
             cleanup_temp_file(converted_file_path)
 
 @router.get("/voice-data-stats")
