@@ -67,11 +67,16 @@ _allowed_origins = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
+    # Also allow any local dev origin (localhost / 127.0.0.1 on any port, e.g. a
+    # Live Server tab or the page opened on a different port). This is safe —
+    # localhost origins only come from the same machine. For production, serve
+    # the frontend from a real domain and add it via ALLOWED_ORIGINS.
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-API-Key"],
 )
-print(f"🔒 CORS allowed origins: {_allowed_origins}")
+print(f"🔒 CORS allowed origins: {_allowed_origins} (+ localhost/127.0.0.1 any port)")
 
 # Include router
 app.include_router(router)

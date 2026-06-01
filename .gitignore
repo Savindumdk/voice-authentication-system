@@ -6,6 +6,7 @@ venv
 # Secrets / environment
 .env
 *.env
+.env.*
 !.env.example
 
 # Model artifacts
