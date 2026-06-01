@@ -15,6 +15,7 @@ from security import require_api_key, rate_limit
 from matching import rank_matches
 from antispoof import gate as antispoof_gate
 from config import settings
+from embeddings import extract_embedding
 from typing import Optional
 from dotenv import load_dotenv
 import asyncio
@@ -2337,7 +2338,7 @@ async def enroll_sample(user_id: str = Form(...), file: UploadFile = File(...)):
         print(f"🎯 Applied enhanced enrollment speaker selection, processed shape={signal.shape}")
         
         # Extract embedding
-        embedding = speaker_encoder.encode_batch(signal)
+        embedding = extract_embedding(signal)
         embedding = embedding.to(DEVICE)  # Ensure embedding is on GPU
         print(f"🔢 Generated embedding shape: {embedding.shape}")
         
@@ -2507,7 +2508,7 @@ async def enroll_speaker(user_id: str = Form(...), file: UploadFile = File(...))
         print(f"🎯 Applied enhanced enrollment speaker selection, processed shape={signal.shape}")
         
         # Extract embedding using EncoderClassifier
-        embedding = speaker_encoder.encode_batch(signal)
+        embedding = extract_embedding(signal)
         embedding = embedding.to(DEVICE)  # Ensure embedding is on GPU
         print(f"🔢 Generated embedding shape: {embedding.shape}")
         
@@ -2607,7 +2608,7 @@ async def smart_authenticate(background_tasks: BackgroundTasks, user_id: str = F
                 print("⏭️ HEAVY_PIPELINE_MODE=off — skipping VAD/diarization/separation")
             
             # Extract embedding from verification audio
-            verification_embedding = speaker_verifier.encode_batch(signal)
+            verification_embedding = extract_embedding(signal)
             verification_embedding = verification_embedding.to(DEVICE)  # Ensure embedding is on GPU
             print(f"🔢 Generated verification embedding shape: {verification_embedding.shape}")
             
@@ -2670,7 +2671,7 @@ async def smart_authenticate(background_tasks: BackgroundTasks, user_id: str = F
             print(f"🎯 Applied enhanced enrollment speaker selection, processed shape={signal.shape}")
             
             # Extract embedding using EncoderClassifier
-            embedding = speaker_encoder.encode_batch(signal)
+            embedding = extract_embedding(signal)
             embedding = embedding.to(DEVICE)  # Ensure embedding is on GPU
             print(f"🔢 Generated enrollment embedding shape: {embedding.shape}")
             
@@ -2811,7 +2812,7 @@ async def smart_authenticate_labeled(
                 print("⏭️ HEAVY_PIPELINE_MODE=off — skipping VAD/diarization/separation")
             
             # Extract embedding from verification audio
-            verification_embedding = speaker_verifier.encode_batch(signal)
+            verification_embedding = extract_embedding(signal)
             verification_embedding = verification_embedding.to(DEVICE)  # Ensure embedding is on GPU
             print(f"🔢 Generated verification embedding shape: {verification_embedding.shape}")
             
@@ -2898,7 +2899,7 @@ async def smart_authenticate_labeled(
             print(f"🎯 Applied enhanced enrollment speaker selection, processed shape={signal.shape}")
             
             # Extract embedding using EncoderClassifier
-            embedding = speaker_encoder.encode_batch(signal)
+            embedding = extract_embedding(signal)
             embedding = embedding.to(DEVICE)  # Ensure embedding is on GPU
             print(f"🔢 Generated enrollment embedding shape: {embedding.shape}")
             
@@ -3040,7 +3041,7 @@ async def identify_speaker(background_tasks: BackgroundTasks, file: UploadFile =
         
         # Import speaker_encoder from main
         from main import speaker_encoder
-        verification_embedding = speaker_encoder.encode_batch(verification_signal)
+        verification_embedding = extract_embedding(verification_signal)
         verification_embedding = verification_embedding.to(DEVICE)  # Ensure GPU
         
         print(f"🎯 Verification embedding shape: {verification_embedding.shape}")

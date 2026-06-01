@@ -49,6 +49,12 @@ class Settings:
     HF_AUTH_TOKEN: str = os.getenv("HF_AUTH_TOKEN", "")
     DEVICE: str = os.getenv("DEVICE", "cuda")
 
+    # Speaker-embedding backend: "ecapa" (default) | "campplus".
+    # Switching requires re-enrolling users (different embedding space/dim).
+    EMBEDDING_BACKEND: str = os.getenv("EMBEDDING_BACKEND", "ecapa").strip().lower()
+    # wespeaker tag / local dir or modelscope id for CAM++.
+    CAMPLUS_MODEL: str = os.getenv("CAMPLUS_MODEL", "")
+
     # --- Thresholds / EWMA ---
     VERIFICATION_THRESHOLD: float = _get_float("VERIFICATION_THRESHOLD", 0.50)
     EWMA_ENABLED: bool = _get_bool("EWMA_ENABLED", True)
@@ -82,8 +88,9 @@ class Settings:
     # "off"    = skip the heavy multi-speaker pipeline (fastest; for cooperative
     #            single-speaker 1:1 auth). Benchmark EER impact before enabling.
     HEAVY_PIPELINE_MODE: str = os.getenv("HEAVY_PIPELINE_MODE", "always").strip().lower()
-    # Use CUDA automatic mixed precision (fp16) for inference. No-op on CPU.
-    USE_AMP: bool = _get_bool("USE_AMP", True)
+    # CUDA mixed-precision (fp16) inference. No-op on CPU. Off by default because
+    # it slightly shifts embedding numerics — enable + recalibrate the threshold.
+    USE_AMP: bool = _get_bool("USE_AMP", False)
 
     # --- Logging ---
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
