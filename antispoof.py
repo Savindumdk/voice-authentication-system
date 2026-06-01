@@ -20,6 +20,7 @@ The concrete checkpoint and its threshold MUST be validated on real
 attack/bonafide data (e.g. ASVspoof 5) on the GPU host before enabling.
 """
 
+import contextlib
 import logging
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -29,6 +30,13 @@ import torch
 from config import settings
 
 logger = logging.getLogger("voice_auth.antispoof")
+
+
+def _amp_context(device: torch.device):
+    """fp16 autocast on CUDA when USE_AMP is on; otherwise a no-op."""
+    if settings.USE_AMP and device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    return contextlib.nullcontext()
 
 _SPOOF_KEYWORDS = ("spoof", "fake", "deepfake", "synthetic", "attack")
 _BONAFIDE_KEYWORDS = ("bona", "real", "genuine", "human")
@@ -128,7 +136,8 @@ class AntiSpoofDetector:
         inputs = self._extractor(
             wav, sampling_rate=sample_rate, return_tensors="pt"
         ).to(self.device)
-        logits = self._model(**inputs).logits
+        with _amp_context(self.device):
+            logits = self._model(**inputs).logits
         probs = torch.softmax(logits, dim=-1).squeeze(0)
         spoof_prob = float(probs[self._spoof_index].item())
         label = self._model.config.id2label.get(self._spoof_index, "spoof")

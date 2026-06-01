@@ -49,11 +49,13 @@ class Settings:
     HF_AUTH_TOKEN: str = os.getenv("HF_AUTH_TOKEN", "")
     DEVICE: str = os.getenv("DEVICE", "cuda")
 
-    # Speaker-embedding backend: "ecapa" (default) | "campplus".
+    # Speaker-embedding backend: "ecapa" (default) | "campplus" | "onnx".
     # Switching requires re-enrolling users (different embedding space/dim).
     EMBEDDING_BACKEND: str = os.getenv("EMBEDDING_BACKEND", "ecapa").strip().lower()
     # wespeaker tag / local dir or modelscope id for CAM++.
     CAMPLUS_MODEL: str = os.getenv("CAMPLUS_MODEL", "")
+    # Path to an exported ONNX embedding model (see scripts/export_ecapa_onnx.py).
+    ONNX_MODEL_PATH: str = os.getenv("ONNX_MODEL_PATH", "")
 
     # --- Thresholds / EWMA ---
     VERIFICATION_THRESHOLD: float = _get_float("VERIFICATION_THRESHOLD", 0.50)
@@ -93,6 +95,13 @@ class Settings:
     USE_AMP: bool = _get_bool("USE_AMP", False)
     # Max concurrent model inferences per worker (bounds GPU oversubscription).
     MAX_CONCURRENT_INFERENCE: int = _get_int("MAX_CONCURRENT_INFERENCE", 2)
+
+    # --- 1:N matching at scale (MongoDB Atlas Vector Search) ---
+    # Off by default: requires an Atlas vector index on the `embedding` field.
+    USE_VECTOR_SEARCH: bool = _get_bool("USE_VECTOR_SEARCH", False)
+    VECTOR_INDEX_NAME: str = os.getenv("VECTOR_INDEX_NAME", "embedding_vector_index")
+    VECTOR_NUM_CANDIDATES: int = _get_int("VECTOR_NUM_CANDIDATES", 100)
+    VECTOR_TOP_K: int = _get_int("VECTOR_TOP_K", 5)
 
     # --- Logging ---
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()

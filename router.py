@@ -113,7 +113,7 @@ if DEVICE.type == "cuda":
     torch.backends.cudnn.deterministic = False  # Allow non-deterministic algorithms for speed
 
 # Import database functions
-from database import save_user_embedding, get_all_user_embeddings, user_exists, save_user_samples, get_user_enrollment_info, update_user_embedding_ewma, store_voice_sample, store_labeled_voice_sample, get_voice_data_statistics, get_user_voice_samples
+from database import save_user_embedding, get_all_user_embeddings, user_exists, save_user_samples, get_user_enrollment_info, update_user_embedding_ewma, store_voice_sample, store_labeled_voice_sample, get_voice_data_statistics, get_user_voice_samples, vector_search_users
 
 # Import global models
 from models import speaker_encoder, speaker_verifier, model_manager, DEVICE, CONFIG
@@ -2976,10 +2976,13 @@ async def identify_speaker(background_tasks: BackgroundTasks, file: UploadFile =
     if not speaker_verifier:
         raise HTTPException(status_code=500, detail="Speaker verifier model not available.")
     
-    enrolled_embeddings = await run_blocking(get_all_user_embeddings)
-    if not enrolled_embeddings:
+    # When Atlas Vector Search handles matching AND the heavy multi-speaker
+    # pipeline is off, we avoid loading every embedding into memory.
+    need_full_embeddings = (not settings.USE_VECTOR_SEARCH) or (settings.HEAVY_PIPELINE_MODE != "off")
+    enrolled_embeddings = await run_blocking(get_all_user_embeddings) if need_full_embeddings else {}
+    if need_full_embeddings and not enrolled_embeddings:
         raise HTTPException(status_code=404, detail="No enrolled users found.")
-    
+
     verification_temp_file = None
     converted_file_path = None
     
@@ -3054,9 +3057,19 @@ async def identify_speaker(background_tasks: BackgroundTasks, file: UploadFile =
         
         print(f"🎯 Verification embedding shape: {verification_embedding.shape}")
         
-        # Compare with all enrolled users using a single batched cosine op.
-        # (Equivalent to the previous per-user loop, but O(1) Python overhead.)
-        ranked = rank_matches(verification_embedding, enrolled_embeddings)
+        # 1:N matching. Prefer Atlas Vector Search (scales without loading every
+        # embedding); otherwise the in-memory batched cosine over all users.
+        if settings.USE_VECTOR_SEARCH:
+            query_vec = verification_embedding.squeeze().detach().cpu().tolist()
+            ranked = await run_blocking(
+                vector_search_users,
+                query_vec,
+                settings.VECTOR_TOP_K,
+                settings.VECTOR_NUM_CANDIDATES,
+                settings.VECTOR_INDEX_NAME,
+            )
+        else:
+            ranked = rank_matches(verification_embedding, enrolled_embeddings)
         for user_id, current_score in ranked:
             print(f"👤 User '{user_id}': similarity score = {current_score:.4f}")
         if ranked:

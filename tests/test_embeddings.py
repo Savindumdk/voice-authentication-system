@@ -74,3 +74,19 @@ def test_as_batched_shapes():
     assert embeddings._as_batched(torch.randn(192)).shape == (1, 1, 192)
     assert embeddings._as_batched(torch.randn(1, 192)).shape == (1, 1, 192)
     assert embeddings._as_batched(torch.randn(1, 1, 192)).shape == (1, 1, 192)
+
+
+def test_onnx_backend_selected(monkeypatch):
+    monkeypatch.setattr(embeddings.settings, "EMBEDDING_BACKEND", "onnx")
+    monkeypatch.setattr(embeddings.settings, "ONNX_MODEL_PATH", "models/ecapa.onnx")
+    backend = embeddings.get_backend()
+    assert backend.name == "onnx"
+    assert backend.model_path == "models/ecapa.onnx"
+
+
+def test_onnx_backend_requires_path(monkeypatch):
+    monkeypatch.setattr(embeddings.settings, "EMBEDDING_BACKEND", "onnx")
+    monkeypatch.setattr(embeddings.settings, "ONNX_MODEL_PATH", "")
+    backend = embeddings.get_backend()
+    with pytest.raises(RuntimeError):
+        backend.extract(torch.randn(1, 16000))

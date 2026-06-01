@@ -221,6 +221,53 @@ def get_all_user_embeddings() -> Dict[str, torch.Tensor]:
         print(f"Error retrieving all user embeddings: {e}")
         return {}
 
+def vector_search_users(query_vector: list, limit: int = 5, num_candidates: int = 100,
+                        index_name: str = "embedding_vector_index") -> list:
+    """
+    Approximate 1:N nearest-neighbor search via MongoDB Atlas Vector Search.
+
+    Avoids loading every embedding into memory each request — scales to large
+    enrollments. Requires an Atlas vector index on the `embedding` field using
+    the `cosine` similarity metric (see docs/atlas_vector_search.md).
+
+    Returns a list of (user_id, cosine_score) sorted best-first. The Atlas cosine
+    score is mapped back to a raw cosine in [-1, 1] (raw = 2*score - 1) so it is
+    directly comparable to VERIFICATION_THRESHOLD used by the in-memory path.
+    """
+    if collection is None:
+        return []
+
+    try:
+        pipeline = [
+            {
+                "$vectorSearch": {
+                    "index": index_name,
+                    "path": "embedding",
+                    "queryVector": [float(x) for x in query_vector],
+                    "numCandidates": int(num_candidates),
+                    "limit": int(limit),
+                }
+            },
+            {
+                "$project": {
+                    "_id": 0,
+                    "user_id": 1,
+                    "score": {"$meta": "vectorSearchScore"},
+                }
+            },
+        ]
+        results = collection.aggregate(pipeline)
+        ranked = []
+        for doc in results:
+            if "user_id" in doc:
+                atlas_score = float(doc.get("score", 0.0))
+                raw_cosine = 2.0 * atlas_score - 1.0  # cosine index mapping
+                ranked.append((doc["user_id"], raw_cosine))
+        return ranked
+    except Exception as e:
+        print(f"❌ Vector search failed: {e}")
+        return []
+
 def user_exists(user_id: str) -> bool:
     """Check if user exists in MongoDB."""
     if collection is None:

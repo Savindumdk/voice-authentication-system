@@ -121,6 +121,49 @@ class _CampPlusBackend:
         return _as_batched(emb.float().to(_DEVICE))
 
 
+class _OnnxBackend:
+    """ECAPA exported to ONNX, served with onnxruntime (CUDA or CPU).
+
+    Export the model with scripts/export_ecapa_onnx.py, then set
+    EMBEDDING_BACKEND=onnx and ONNX_MODEL_PATH=/path/to/model.onnx.
+    The exported graph wraps `encode_batch`, so it takes a raw waveform
+    [batch, samples] and returns an embedding — same contract as ECAPA.
+    """
+
+    name = "onnx"
+
+    def __init__(self, model_path: str):
+        self.model_path = model_path
+        self._session = None
+        self._input_name = None
+
+    def _ensure_loaded(self):
+        if self._session is not None:
+            return
+        if not self.model_path:
+            raise RuntimeError("EMBEDDING_BACKEND=onnx but ONNX_MODEL_PATH is not set")
+        import onnxruntime as ort
+
+        providers = (
+            ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            if _DEVICE.type == "cuda"
+            else ["CPUExecutionProvider"]
+        )
+        self._session = ort.InferenceSession(self.model_path, providers=providers)
+        self._input_name = self._session.get_inputs()[0].name
+        logger.info("ONNX embedding model loaded: %s (%s)", self.model_path, providers)
+
+    def extract(self, signal: torch.Tensor, sample_rate: int = 16000) -> torch.Tensor:
+        self._ensure_loaded()
+        wav = signal.detach().float()
+        if wav.dim() == 1:
+            wav = wav.unsqueeze(0)
+        elif wav.dim() > 2:
+            wav = wav.reshape(wav.shape[0], -1)
+        out = self._session.run(None, {self._input_name: wav.cpu().numpy()})[0]
+        return _as_batched(torch.from_numpy(out).float().to(_DEVICE))
+
+
 _backend = None
 
 
@@ -134,6 +177,8 @@ def get_backend():
         _backend = _EcapaBackend()
     elif name == "campplus":
         _backend = _CampPlusBackend(settings.CAMPLUS_MODEL)
+    elif name == "onnx":
+        _backend = _OnnxBackend(settings.ONNX_MODEL_PATH)
     else:
         raise ValueError(f"Unknown EMBEDDING_BACKEND: {name!r}")
     return _backend
