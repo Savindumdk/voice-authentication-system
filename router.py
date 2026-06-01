@@ -1002,9 +1002,9 @@ def convert_audio_to_wav(input_path: str) -> str:
         print(f"❌ Audio conversion error: {e}")
         raise HTTPException(status_code=400, detail=f"Audio conversion failed: {str(e)}")
 
-async def background_retrain_and_store(
-    user_id: str, 
-    verification_embedding: torch.Tensor, 
+def background_retrain_and_store(
+    user_id: str,
+    verification_embedding: torch.Tensor,
     best_score: float,
     verification_signal: torch.Tensor = None,
     fs: int = 16000
@@ -1012,6 +1012,12 @@ async def background_retrain_and_store(
     """
     Background task to handle EWMA adaptation and voice sample storage
     after sending response to frontend for optimal performance.
+
+    Defined as a SYNC function on purpose: it performs blocking pymongo writes
+    (EWMA update + voice-sample insert). FastAPI runs sync background tasks in a
+    threadpool, so this work stays off the event loop. If it were `async def`,
+    Starlette would run it on the loop and the blocking DB calls would stall the
+    worker after the response was sent.
     """
     try:
         from main import CONFIG
