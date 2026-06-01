@@ -46,6 +46,20 @@ def initialize_database():
 
         # Test connection
         client.admin.command('ping')
+
+        # Index the lookup key so 1:1 verification is an indexed single-document
+        # fetch (not a collection scan), and to enforce one voiceprint per user.
+        try:
+            collection.create_index("user_id", unique=True)
+        except Exception as idx_err:
+            # Falls back gracefully (e.g. legacy duplicate user_ids); lookups
+            # still work, just without the unique constraint.
+            print(f"⚠️ Could not create unique index on user_id: {idx_err}")
+            try:
+                collection.create_index("user_id")
+            except Exception as idx_err2:
+                print(f"⚠️ Could not create index on user_id: {idx_err2}")
+
         print("✅ MongoDB connection established successfully.")
         return True
     except Exception as e:

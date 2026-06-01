@@ -113,7 +113,7 @@ if DEVICE.type == "cuda":
     torch.backends.cudnn.deterministic = False  # Allow non-deterministic algorithms for speed
 
 # Import database functions
-from database import save_user_embedding, get_all_user_embeddings, user_exists, save_user_samples, get_user_enrollment_info, update_user_embedding_ewma, store_voice_sample, store_labeled_voice_sample, get_voice_data_statistics, get_user_voice_samples, vector_search_users
+from database import save_user_embedding, get_all_user_embeddings, get_user_embedding, user_exists, save_user_samples, get_user_enrollment_info, update_user_embedding_ewma, store_voice_sample, store_labeled_voice_sample, get_voice_data_statistics, get_user_voice_samples, vector_search_users
 
 # Import global models
 from models import speaker_encoder, speaker_verifier, model_manager, DEVICE, CONFIG
@@ -2603,24 +2603,27 @@ async def smart_authenticate(background_tasks: BackgroundTasks, user_id: str = F
             # USER EXISTS: PERFORM VERIFICATION
             print(f"👤 User '{user_id}' exists - performing verification...")
             
+            # Fetch ONLY this user's voiceprint — an indexed single-document
+            # lookup. 1:1 verification never needs the whole collection.
+            enrolled_embedding = await run_blocking(get_user_embedding, user_id)
+            if enrolled_embedding is None:
+                raise HTTPException(status_code=404, detail=f"No enrolled voiceprint for user '{user_id}'.")
+            enrolled_embedding = enrolled_embedding.to(DEVICE)
+
             # Apply advanced VAD+Diarization pipeline for multi-speaker environments.
             # Skipped when HEAVY_PIPELINE_MODE=off (fast path for cooperative 1:1).
-            enrolled_embeddings = await run_blocking(get_all_user_embeddings)
             if settings.HEAVY_PIPELINE_MODE != "off":
-                enrolled_embeddings_for_pipeline = {user_id: enrolled_embeddings[user_id]}
+                enrolled_embeddings_for_pipeline = {user_id: enrolled_embedding}
                 signal = await run_inference(apply_advanced_vad_diarization_pipeline, signal, enrolled_embeddings_for_pipeline, sample_rate=fs)
                 signal = signal.to(DEVICE)  # Ensure it's on GPU after processing
                 print(f"🎯 Applied advanced VAD+Diarization pipeline, processed shape={signal.shape}")
             else:
                 print("⏭️ HEAVY_PIPELINE_MODE=off — skipping VAD/diarization/separation")
-            
+
             # Extract embedding from verification audio
             verification_embedding = await run_inference(extract_embedding, signal)
             verification_embedding = verification_embedding.to(DEVICE)  # Ensure embedding is on GPU
             print(f"🔢 Generated verification embedding shape: {verification_embedding.shape}")
-            
-            # Get enrolled embedding for the specific user
-            enrolled_embedding = torch.tensor(enrolled_embeddings[user_id]).to(DEVICE)
             
             # Compute similarity score using cosine similarity
             print(f"🔍 Computing similarity score for user '{user_id}'...")
@@ -2807,24 +2810,27 @@ async def smart_authenticate_labeled(
             # USER EXISTS: PERFORM LABELED VERIFICATION
             print(f"👤 User '{user_id}' exists - performing labeled verification...")
             
+            # Fetch ONLY this user's voiceprint — an indexed single-document
+            # lookup. 1:1 verification never needs the whole collection.
+            enrolled_embedding = await run_blocking(get_user_embedding, user_id)
+            if enrolled_embedding is None:
+                raise HTTPException(status_code=404, detail=f"No enrolled voiceprint for user '{user_id}'.")
+            enrolled_embedding = enrolled_embedding.to(DEVICE)
+
             # Apply advanced VAD+Diarization pipeline for multi-speaker environments.
             # Skipped when HEAVY_PIPELINE_MODE=off (fast path for cooperative 1:1).
-            enrolled_embeddings = await run_blocking(get_all_user_embeddings)
             if settings.HEAVY_PIPELINE_MODE != "off":
-                enrolled_embeddings_for_pipeline = {user_id: enrolled_embeddings[user_id]}
+                enrolled_embeddings_for_pipeline = {user_id: enrolled_embedding}
                 signal = await run_inference(apply_advanced_vad_diarization_pipeline, signal, enrolled_embeddings_for_pipeline, sample_rate=fs)
                 signal = signal.to(DEVICE)  # Ensure it's on GPU after processing
                 print(f"🎯 Applied advanced VAD+Diarization pipeline, processed shape={signal.shape}")
             else:
                 print("⏭️ HEAVY_PIPELINE_MODE=off — skipping VAD/diarization/separation")
-            
+
             # Extract embedding from verification audio
             verification_embedding = await run_inference(extract_embedding, signal)
             verification_embedding = verification_embedding.to(DEVICE)  # Ensure embedding is on GPU
             print(f"🔢 Generated verification embedding shape: {verification_embedding.shape}")
-            
-            # Get enrolled embedding for the specific user
-            enrolled_embedding = torch.tensor(enrolled_embeddings[user_id]).to(DEVICE)
             
             # Compute similarity score using cosine similarity
             print(f"🔍 Computing similarity score for user '{user_id}'...")
