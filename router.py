@@ -16,6 +16,7 @@ from matching import rank_matches
 from antispoof import gate as antispoof_gate
 from config import settings
 from embeddings import extract_embedding
+from concurrency import run_blocking, run_inference
 from typing import Optional
 from dotenv import load_dotenv
 import asyncio
@@ -2301,10 +2302,10 @@ async def enroll_sample(user_id: str = Form(...), file: UploadFile = File(...)):
         print(f"📁 Processing sample {len(session.sample_embeddings) + 1} for user '{user_id}'")
         
         # Convert audio to compatible format
-        converted_file_path = convert_audio_to_wav(temp_file_path)
+        converted_file_path = await run_blocking(convert_audio_to_wav, temp_file_path)
         
         # Load and process audio
-        signal, fs = torchaudio.load(converted_file_path)
+        signal, fs = await run_blocking(torchaudio.load, converted_file_path)
         signal = signal.to(DEVICE)  # Move to GPU
         print(f"🎵 Loaded audio: shape={signal.shape}, sample_rate={fs}")
         
@@ -2322,23 +2323,23 @@ async def enroll_sample(user_id: str = Form(...), file: UploadFile = File(...)):
         
         # Apply optimal segment selection for audio longer than 12 seconds
         if signal.shape[-1] / fs > 12.0:
-            signal = find_optimal_speech_segment(signal, fs, target_duration=12.0, min_duration=8.0)
+            signal = await run_blocking(find_optimal_speech_segment, signal, fs, target_duration=12.0, min_duration=8.0)
             print(f"✅ Selected optimal {signal.shape[-1]/fs:.1f}s segment from original {original_signal.shape[-1]/fs:.1f}s audio")
         else:
             print(f"📋 Audio duration ({signal.shape[-1]/fs:.1f}s) within optimal range, proceeding without segment selection")
         
         # 🔇 ENHANCED PAUSE-ROBUST PROCESSING
         print("🔇 Applying enhanced pause-robust processing for enrollment...")
-        signal = enhanced_pause_robust_processing(signal, fs)
+        signal = await run_blocking(enhanced_pause_robust_processing, signal, fs)
         print(f"✅ Pause processing complete: {signal.shape[-1]/fs:.1f}s continuous speech")
         
         # Apply enhanced enrollment speaker selection (optimized for enrollment quality)
-        signal = apply_enrollment_speaker_selection(signal, sample_rate=fs)
+        signal = await run_inference(apply_enrollment_speaker_selection, signal, sample_rate=fs)
         signal = signal.to(DEVICE)  # Ensure it's on GPU after processing
         print(f"🎯 Applied enhanced enrollment speaker selection, processed shape={signal.shape}")
         
         # Extract embedding
-        embedding = extract_embedding(signal)
+        embedding = await run_inference(extract_embedding, signal)
         embedding = embedding.to(DEVICE)  # Ensure embedding is on GPU
         print(f"🔢 Generated embedding shape: {embedding.shape}")
         
@@ -2471,10 +2472,10 @@ async def enroll_speaker(user_id: str = Form(...), file: UploadFile = File(...))
         print(f"📁 Uploaded file type: {file.content_type}, filename: {file.filename}")
         
         # Convert audio to compatible format
-        converted_file_path = convert_audio_to_wav(temp_file_path)
+        converted_file_path = await run_blocking(convert_audio_to_wav, temp_file_path)
         
         # Load audio using torchaudio (as per SpeechBrain documentation)
-        signal, fs = torchaudio.load(converted_file_path)
+        signal, fs = await run_blocking(torchaudio.load, converted_file_path)
         signal = signal.to(DEVICE)  # Move to GPU
         print(f"🎵 Loaded audio: shape={signal.shape}, sample_rate={fs}")
         
@@ -2492,23 +2493,23 @@ async def enroll_speaker(user_id: str = Form(...), file: UploadFile = File(...))
         
         # Apply optimal segment selection for audio longer than 12 seconds
         if signal.shape[-1] / fs > 12.0:
-            signal = find_optimal_speech_segment(signal, fs, target_duration=12.0, min_duration=8.0)
+            signal = await run_blocking(find_optimal_speech_segment, signal, fs, target_duration=12.0, min_duration=8.0)
             print(f"✅ Selected optimal {signal.shape[-1]/fs:.1f}s segment from original {original_signal.shape[-1]/fs:.1f}s audio")
         else:
             print(f"📋 Audio duration ({signal.shape[-1]/fs:.1f}s) within optimal range, proceeding without segment selection")
         
         # 🔇 ENHANCED PAUSE-ROBUST PROCESSING
         print("🔇 Applying enhanced pause-robust processing for single enrollment...")
-        signal = enhanced_pause_robust_processing(signal, fs)
+        signal = await run_blocking(enhanced_pause_robust_processing, signal, fs)
         print(f"✅ Pause processing complete: {signal.shape[-1]/fs:.1f}s continuous speech")
         
         # Apply enhanced enrollment speaker selection (optimized for enrollment quality)
-        signal = apply_enrollment_speaker_selection(signal, sample_rate=fs)
+        signal = await run_inference(apply_enrollment_speaker_selection, signal, sample_rate=fs)
         signal = signal.to(DEVICE)  # Ensure it's on GPU after processing
         print(f"🎯 Applied enhanced enrollment speaker selection, processed shape={signal.shape}")
         
         # Extract embedding using EncoderClassifier
-        embedding = extract_embedding(signal)
+        embedding = await run_inference(extract_embedding, signal)
         embedding = embedding.to(DEVICE)  # Ensure embedding is on GPU
         print(f"🔢 Generated embedding shape: {embedding.shape}")
         
@@ -2563,10 +2564,10 @@ async def smart_authenticate(background_tasks: BackgroundTasks, user_id: str = F
         print(f"📁 Processing smart auth for user '{user_id}' (exists: {user_already_exists})")
         
         # Convert audio to compatible format
-        converted_file_path = convert_audio_to_wav(temp_file_path)
+        converted_file_path = await run_blocking(convert_audio_to_wav, temp_file_path)
         
         # Load and process audio
-        signal, fs = torchaudio.load(converted_file_path)
+        signal, fs = await run_blocking(torchaudio.load, converted_file_path)
         signal = signal.to(DEVICE)  # Move to GPU
         print(f"🎵 Loaded audio: shape={signal.shape}, sample_rate={fs}")
         
@@ -2576,7 +2577,7 @@ async def smart_authenticate(background_tasks: BackgroundTasks, user_id: str = F
             raise HTTPException(status_code=400, detail=f"Audio quality check failed: {error_message}")
 
         # 🛡️ ANTI-SPOOFING / LIVENESS GATE (no-op unless ANTISPOOF_ENABLED)
-        allowed, antispoof_detail = antispoof_gate(signal, fs)
+        allowed, antispoof_detail = await run_inference(antispoof_gate, signal, fs)
         if not allowed:
             raise HTTPException(status_code=403, detail=f"Liveness check failed: {antispoof_detail}")
 
@@ -2585,7 +2586,7 @@ async def smart_authenticate(background_tasks: BackgroundTasks, user_id: str = F
 
         # Apply optimal segment selection for audio longer than 12 seconds
         if signal.shape[-1] / fs > 12.0:
-            signal = find_optimal_speech_segment(signal, fs, target_duration=12.0, min_duration=4.0)
+            signal = await run_blocking(find_optimal_speech_segment, signal, fs, target_duration=12.0, min_duration=4.0)
             print(f"✅ Selected optimal segment: {signal.shape[-1]/fs:.1f}s")
         else:
             print(f"✅ Audio duration acceptable: {signal.shape[-1]/fs:.1f}s")
@@ -2598,17 +2599,17 @@ async def smart_authenticate(background_tasks: BackgroundTasks, user_id: str = F
             
             # Apply advanced VAD+Diarization pipeline for multi-speaker environments.
             # Skipped when HEAVY_PIPELINE_MODE=off (fast path for cooperative 1:1).
-            enrolled_embeddings = get_all_user_embeddings()
+            enrolled_embeddings = await run_blocking(get_all_user_embeddings)
             if settings.HEAVY_PIPELINE_MODE != "off":
                 enrolled_embeddings_for_pipeline = {user_id: enrolled_embeddings[user_id]}
-                signal = apply_advanced_vad_diarization_pipeline(signal, enrolled_embeddings_for_pipeline, sample_rate=fs)
+                signal = await run_inference(apply_advanced_vad_diarization_pipeline, signal, enrolled_embeddings_for_pipeline, sample_rate=fs)
                 signal = signal.to(DEVICE)  # Ensure it's on GPU after processing
                 print(f"🎯 Applied advanced VAD+Diarization pipeline, processed shape={signal.shape}")
             else:
                 print("⏭️ HEAVY_PIPELINE_MODE=off — skipping VAD/diarization/separation")
             
             # Extract embedding from verification audio
-            verification_embedding = extract_embedding(signal)
+            verification_embedding = await run_inference(extract_embedding, signal)
             verification_embedding = verification_embedding.to(DEVICE)  # Ensure embedding is on GPU
             print(f"🔢 Generated verification embedding shape: {verification_embedding.shape}")
             
@@ -2666,12 +2667,12 @@ async def smart_authenticate(background_tasks: BackgroundTasks, user_id: str = F
             print(f"🆕 User '{user_id}' doesn't exist - performing enrollment...")
             
             # Apply enhanced enrollment speaker selection (optimized for enrollment quality)
-            signal = apply_enrollment_speaker_selection(signal, sample_rate=fs)
+            signal = await run_inference(apply_enrollment_speaker_selection, signal, sample_rate=fs)
             signal = signal.to(DEVICE)  # Ensure it's on GPU after processing
             print(f"🎯 Applied enhanced enrollment speaker selection, processed shape={signal.shape}")
             
             # Extract embedding using EncoderClassifier
-            embedding = extract_embedding(signal)
+            embedding = await run_inference(extract_embedding, signal)
             embedding = embedding.to(DEVICE)  # Ensure embedding is on GPU
             print(f"🔢 Generated enrollment embedding shape: {embedding.shape}")
             
@@ -2755,10 +2756,10 @@ async def smart_authenticate_labeled(
         print(f"🏷️ Processing labeled smart auth for user '{user_id}' [{label_str}] (exists: {user_already_exists})")
         
         # Convert audio to compatible format
-        converted_file_path = convert_audio_to_wav(temp_file_path)
+        converted_file_path = await run_blocking(convert_audio_to_wav, temp_file_path)
         
         # Load and process audio
-        signal, fs = torchaudio.load(converted_file_path)
+        signal, fs = await run_blocking(torchaudio.load, converted_file_path)
         signal = signal.to(DEVICE)  # Move to GPU
         print(f"🎵 Loaded audio: shape={signal.shape}, sample_rate={fs}")
         
@@ -2768,7 +2769,7 @@ async def smart_authenticate_labeled(
             raise HTTPException(status_code=400, detail=f"Audio quality check failed: {error_message}")
 
         # 🛡️ ANTI-SPOOFING / LIVENESS GATE (no-op unless ANTISPOOF_ENABLED)
-        allowed, antispoof_detail = antispoof_gate(signal, fs)
+        allowed, antispoof_detail = await run_inference(antispoof_gate, signal, fs)
         if not allowed:
             raise HTTPException(status_code=403, detail=f"Liveness check failed: {antispoof_detail}")
 
@@ -2777,7 +2778,7 @@ async def smart_authenticate_labeled(
 
         # Apply optimal segment selection for audio longer than 12 seconds
         if signal.shape[-1] / fs > 12.0:
-            signal = find_optimal_speech_segment(signal, fs, target_duration=12.0, min_duration=4.0)
+            signal = await run_blocking(find_optimal_speech_segment, signal, fs, target_duration=12.0, min_duration=4.0)
             print(f"✅ Selected optimal segment: {signal.shape[-1]/fs:.1f}s")
         else:
             print(f"✅ Audio duration acceptable: {signal.shape[-1]/fs:.1f}s")
@@ -2785,7 +2786,7 @@ async def smart_authenticate_labeled(
         # 🔇 ENHANCED PAUSE-ROBUST PROCESSING
         print("🔇 Applying enhanced pause-robust processing...")
         original_duration_sec = signal.shape[-1] / fs
-        signal = enhanced_pause_robust_processing(signal, fs)
+        signal = await run_blocking(enhanced_pause_robust_processing, signal, fs)
         processed_duration_sec = signal.shape[-1] / fs
         print(f"✅ Pause processing complete: {processed_duration_sec:.1f}s continuous speech")
 
@@ -2802,17 +2803,17 @@ async def smart_authenticate_labeled(
             
             # Apply advanced VAD+Diarization pipeline for multi-speaker environments.
             # Skipped when HEAVY_PIPELINE_MODE=off (fast path for cooperative 1:1).
-            enrolled_embeddings = get_all_user_embeddings()
+            enrolled_embeddings = await run_blocking(get_all_user_embeddings)
             if settings.HEAVY_PIPELINE_MODE != "off":
                 enrolled_embeddings_for_pipeline = {user_id: enrolled_embeddings[user_id]}
-                signal = apply_advanced_vad_diarization_pipeline(signal, enrolled_embeddings_for_pipeline, sample_rate=fs)
+                signal = await run_inference(apply_advanced_vad_diarization_pipeline, signal, enrolled_embeddings_for_pipeline, sample_rate=fs)
                 signal = signal.to(DEVICE)  # Ensure it's on GPU after processing
                 print(f"🎯 Applied advanced VAD+Diarization pipeline, processed shape={signal.shape}")
             else:
                 print("⏭️ HEAVY_PIPELINE_MODE=off — skipping VAD/diarization/separation")
             
             # Extract embedding from verification audio
-            verification_embedding = extract_embedding(signal)
+            verification_embedding = await run_inference(extract_embedding, signal)
             verification_embedding = verification_embedding.to(DEVICE)  # Ensure embedding is on GPU
             print(f"🔢 Generated verification embedding shape: {verification_embedding.shape}")
             
@@ -2894,12 +2895,12 @@ async def smart_authenticate_labeled(
             print(f"🆕 User '{user_id}' doesn't exist - performing labeled enrollment...")
             
             # Apply enhanced enrollment speaker selection (optimized for enrollment quality)
-            signal = apply_enrollment_speaker_selection(signal, sample_rate=fs)
+            signal = await run_inference(apply_enrollment_speaker_selection, signal, sample_rate=fs)
             signal = signal.to(DEVICE)  # Ensure it's on GPU after processing
             print(f"🎯 Applied enhanced enrollment speaker selection, processed shape={signal.shape}")
             
             # Extract embedding using EncoderClassifier
-            embedding = extract_embedding(signal)
+            embedding = await run_inference(extract_embedding, signal)
             embedding = embedding.to(DEVICE)  # Ensure embedding is on GPU
             print(f"🔢 Generated enrollment embedding shape: {embedding.shape}")
             
@@ -2969,7 +2970,7 @@ async def identify_speaker(background_tasks: BackgroundTasks, file: UploadFile =
     if not speaker_verifier:
         raise HTTPException(status_code=500, detail="Speaker verifier model not available.")
     
-    enrolled_embeddings = get_all_user_embeddings()
+    enrolled_embeddings = await run_blocking(get_all_user_embeddings)
     if not enrolled_embeddings:
         raise HTTPException(status_code=404, detail="No enrolled users found.")
     
@@ -2985,7 +2986,7 @@ async def identify_speaker(background_tasks: BackgroundTasks, file: UploadFile =
         print(f"📁 Uploaded file type: {file.content_type}, filename: {file.filename}")
         
         # Convert audio to compatible format
-        converted_file_path = convert_audio_to_wav(verification_temp_file)
+        converted_file_path = await run_blocking(convert_audio_to_wav, verification_temp_file)
         
         best_score = -1.0
         identified_user = None
@@ -2993,7 +2994,7 @@ async def identify_speaker(background_tasks: BackgroundTasks, file: UploadFile =
         print(f"\n🔍 Starting speaker verification for {len(enrolled_embeddings)} enrolled users...")
         
         # Load verification audio
-        verification_signal, fs = torchaudio.load(converted_file_path)
+        verification_signal, fs = await run_blocking(torchaudio.load, converted_file_path)
         verification_signal = verification_signal.to(DEVICE)  # Move to GPU
         print(f"🎵 Loaded verification audio: shape={verification_signal.shape}, sample_rate={fs}")
         
@@ -3006,7 +3007,7 @@ async def identify_speaker(background_tasks: BackgroundTasks, file: UploadFile =
             raise HTTPException(status_code=400, detail=error_message)
 
         # 🛡️ ANTI-SPOOFING / LIVENESS GATE (no-op unless ANTISPOOF_ENABLED)
-        allowed, antispoof_detail = antispoof_gate(verification_signal, fs)
+        allowed, antispoof_detail = await run_inference(antispoof_gate, verification_signal, fs)
         if not allowed:
             raise HTTPException(status_code=403, detail=f"Liveness check failed: {antispoof_detail}")
 
@@ -3016,20 +3017,21 @@ async def identify_speaker(background_tasks: BackgroundTasks, file: UploadFile =
         
         # Apply optimal segment selection for audio longer than 12 seconds
         if verification_signal.shape[-1] / fs > 12.0:
-            verification_signal = find_optimal_speech_segment(verification_signal, fs, target_duration=12.0, min_duration=4.0)
+            verification_signal = await run_blocking(find_optimal_speech_segment, verification_signal, fs, target_duration=12.0, min_duration=4.0)
             print(f"✅ Selected optimal {verification_signal.shape[-1]/fs:.1f}s segment from original {original_verification_signal.shape[-1]/fs:.1f}s audio")
         else:
             print(f"📋 Audio duration ({verification_signal.shape[-1]/fs:.1f}s) within optimal range, proceeding without segment selection")
         
         # 🔇 ENHANCED PAUSE-ROBUST PROCESSING
         print("🔇 Applying enhanced pause-robust processing...")
-        verification_signal = enhanced_pause_robust_processing(verification_signal, fs)
+        verification_signal = await run_blocking(enhanced_pause_robust_processing, verification_signal, fs)
         print(f"✅ Pause processing complete: {verification_signal.shape[-1]/fs:.1f}s continuous speech")
         
         # Apply advanced VAD+Diarization+Separation pipeline with enrolled embeddings.
         # Skipped when HEAVY_PIPELINE_MODE=off (fast path).
         if settings.HEAVY_PIPELINE_MODE != "off":
-            verification_signal = apply_advanced_vad_diarization_pipeline(
+            verification_signal = await run_inference(
+                apply_advanced_vad_diarization_pipeline,
                 verification_signal,
                 enrolled_embeddings=enrolled_embeddings,
                 sample_rate=fs
@@ -3041,7 +3043,7 @@ async def identify_speaker(background_tasks: BackgroundTasks, file: UploadFile =
         
         # Import speaker_encoder from main
         from main import speaker_encoder
-        verification_embedding = extract_embedding(verification_signal)
+        verification_embedding = await run_inference(extract_embedding, verification_signal)
         verification_embedding = verification_embedding.to(DEVICE)  # Ensure GPU
         
         print(f"🎯 Verification embedding shape: {verification_embedding.shape}")

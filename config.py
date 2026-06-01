@@ -91,6 +91,8 @@ class Settings:
     # CUDA mixed-precision (fp16) inference. No-op on CPU. Off by default because
     # it slightly shifts embedding numerics — enable + recalibrate the threshold.
     USE_AMP: bool = _get_bool("USE_AMP", False)
+    # Max concurrent model inferences per worker (bounds GPU oversubscription).
+    MAX_CONCURRENT_INFERENCE: int = _get_int("MAX_CONCURRENT_INFERENCE", 2)
 
     # --- Logging ---
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
